@@ -1,6 +1,7 @@
 import argparse
 import asyncio
 import logging
+import os
 from datetime import datetime, timezone
 from typing import Literal
 
@@ -667,9 +668,37 @@ if __name__ == "__main__":
     publish_to_metaculus = True
     print_startup_banner(run_mode, will_publish=publish_to_metaculus)
 
-    # Configure the bot. The `llms=` block below is commented out to use
-    # whichever default models forecasting-tools picks based on your env vars;
-    # uncomment and edit to pin specific models.
+    # ---- Tom's configuration (Fall 2026) ------------------------------------
+    # Strong models via OpenRouter once the free FutureEval credits key
+    # (OPENROUTER_API_KEY) is added as a GitHub secret. Without it, the bot
+    # falls back to the Metaculus LLM proxy (older, weaker models) and only
+    # runs the test mode — see the tournament gate below.
+    openrouter_key = os.getenv("OPENROUTER_API_KEY", "").strip()
+    has_strong_llm = openrouter_key not in ("", "REPLACE_ME")
+    if has_strong_llm:
+        chosen_llms = {
+            "default": GeneralLlm(
+                model="openrouter/anthropic/claude-sonnet-4.6",
+                temperature=0.3,
+                timeout=180,
+                allowed_tries=2,
+            ),
+            "summarizer": GeneralLlm(
+                model="openrouter/openai/gpt-4o-mini", temperature=0.3
+            ),
+            "researcher": GeneralLlm(
+                model="openrouter/perplexity/sonar-pro",
+                temperature=0.1,
+                timeout=180,
+                allowed_tries=2,
+            ),
+            "parser": GeneralLlm(
+                model="openrouter/openai/gpt-4o-mini", temperature=0.3
+            ),
+        }
+    else:
+        chosen_llms = None  # forecasting-tools defaults -> Metaculus LLM proxy
+
     template_bot = SummerTemplateBot2026(
         research_reports_per_question=1,
         predictions_per_research_report=5,
@@ -678,24 +707,19 @@ if __name__ == "__main__":
         folder_to_save_reports_to=None,
         skip_previously_forecasted_questions=True,
         extra_metadata_in_explanation=True,
-        # llms={
-        #     "default": GeneralLlm(
-        #         model="openrouter/openai/gpt-4o",
-        #         temperature=0.3,
-        #         timeout=40,
-        #         allowed_tries=2,
-        #     ),
-        #     "summarizer": "openai/gpt-4o-mini",
-        #     "researcher": "asknews/news-summaries",
-        #     "parser": "openai/gpt-4o-mini",
-        # },
+        llms=chosen_llms,
     )
+
+    # Fall 2026 FutureEval seasonal tournament (28 Sep 2026 - 6 Jan 2027).
+    # The pinned forecasting-tools version still points CURRENT_AI_COMPETITION_ID
+    # at the Summer 2026 tournament, so target Fall 2026 explicitly (ID 33121).
+    FALL_2026_TOURNAMENT = "fall-futureeval-2026"
 
     # Per-mode tournament URL shown in the summary banner footer. These
     # piggyback on the forecasting_tools SDK constants and need updating
     # whenever those rotate seasons.
     TOURNAMENT_URLS = {
-        "tournament": "https://www.metaculus.com/tournament/summer-futureeval-2026/",
+        "tournament": "https://www.metaculus.com/tournament/fall-futureeval-2026/",
         "metaculus_cup": "https://www.metaculus.com/tournament/metaculus-cup-summer-2025/",
         "test_questions": "https://www.metaculus.com/tournament/bot-testing-area/",
     }
@@ -705,17 +729,27 @@ if __name__ == "__main__":
     # summary printers below.
     client = MetaculusClient()
     if run_mode == "tournament":
-        seasonal_tournament_reports = asyncio.run(
-            template_bot.forecast_on_tournament(
-                client.CURRENT_AI_COMPETITION_ID, return_exceptions=True
+        if not has_strong_llm:
+            # A weak fallback model would likely score below the other bots,
+            # which hurts the tournament score more than skipping. Wait for
+            # the free OpenRouter credits key instead.
+            print(
+                "⏸️  OPENROUTER_API_KEY not set yet - skipping tournament forecasts.\n"
+                "    Add it under Settings -> Secrets and variables -> Actions.\n"
             )
-        )
-        minibench_reports = asyncio.run(
-            template_bot.forecast_on_tournament(
-                client.CURRENT_MINIBENCH_ID, return_exceptions=True
+            forecast_reports = []
+        else:
+            seasonal_tournament_reports = asyncio.run(
+                template_bot.forecast_on_tournament(
+                    FALL_2026_TOURNAMENT, return_exceptions=True
+                )
             )
-        )
-        forecast_reports = seasonal_tournament_reports + minibench_reports
+            minibench_reports = asyncio.run(
+                template_bot.forecast_on_tournament(
+                    client.CURRENT_MINIBENCH_ID, return_exceptions=True
+                )
+            )
+            forecast_reports = seasonal_tournament_reports + minibench_reports
     elif run_mode == "metaculus_cup":
         # The Metaculus Cup may be uninitialized near the start of a season
         # (Jan/May/Sep). AXC_2025_TOURNAMENT_ID = 32564 and
