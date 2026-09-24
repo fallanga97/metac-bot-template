@@ -1,7 +1,9 @@
 import argparse
 import asyncio
+import json
 import logging
 import os
+import re
 from datetime import datetime, timezone
 from typing import Literal
 
@@ -132,7 +134,182 @@ class SummerTemplateBot2026(ForecastBot):
 
     ##################################### RESEARCH #####################################
 
+    # ---- Fact-check desk research (Tom's addition, Fall 2026) ----------------
+    # 1. Break the question into the few factual claims its outcome hinges on.
+    # 2. Check each claim with web search - in English and, when the question is
+    #    mainly about a non-English-speaking country, also in the local language.
+    # 3. Grade the evidence (official/primary > wire/news > commentary) and give
+    #    the forecaster a fact sheet with CONFIRMED / CONTRADICTED / UNVERIFIED
+    #    verdicts instead of raw search results.
+    # Any failure falls back to the original template research below.
+    use_fact_check_research: bool = False  # switched on in __main__ when strong LLMs are configured
+    _max_claims = 4
+    _max_searches = 8
+    _search_concurrency = 4
+
     async def run_research(self, question: MetaculusQuestion) -> str:
+        if self.use_fact_check_research:
+            try:
+                return await self._fact_check_research(question)
+            except Exception as e:
+                logger.warning(
+                    f"Fact-check research failed for {question.page_url} "
+                    f"({type(e).__name__}: {e}); falling back to template research."
+                )
+        return await self._template_research(question)
+
+    @staticmethod
+    def _question_brief(question: MetaculusQuestion) -> str:
+        parts = [f"Question: {question.question_text}"]
+        if question.background_info:
+            parts.append(f"Background: {question.background_info[:3000]}")
+        if question.resolution_criteria:
+            parts.append(f"Resolution criteria: {question.resolution_criteria}")
+        if question.fine_print:
+            parts.append(f"Fine print: {question.fine_print}")
+        if question.scheduled_resolution_time:
+            parts.append(
+                f"Scheduled resolution date: {question.scheduled_resolution_time:%Y-%m-%d}"
+            )
+        options = getattr(question, "options", None)
+        if options:
+            parts.append(f"Answer options: {options}")
+        if getattr(question, "unit_of_measure", None):
+            parts.append(f"Unit: {question.unit_of_measure}")
+        return "\n".join(parts)
+
+    @staticmethod
+    def _extract_json(text: str) -> dict:
+        cleaned = re.sub(r"```(?:json)?", "", text)
+        start, end = cleaned.find("{"), cleaned.rfind("}")
+        if start == -1 or end <= start:
+            raise ValueError("no JSON object in claim plan")
+        return json.loads(cleaned[start : end + 1])
+
+    async def _plan_claims(self, question: MetaculusQuestion) -> dict:
+        today = datetime.now().strftime("%Y-%m-%d")
+        prompt = clean_indents(
+            f"""
+            You are the research editor of a fact-checking desk that supports a forecaster. Today is {today}.
+
+            {self._question_brief(question)}
+
+            Break this question into the {self._max_claims} most decision-relevant factual claims that should be verified right now, for example: the current status quo, what exactly counts under the resolution criteria, scheduled events before the resolution date, and the latest value of any key number.
+            Also identify the country or countries the question is mainly about, and their main language(s) if that is not English.
+
+            Respond with JSON only, no other text, in exactly this shape:
+            {{"countries": ["..."], "local_languages": ["..."], "claims": [{{"claim": "...", "query_en": "...", "query_local": "..."}}]}}
+
+            Rules: at most {self._max_claims} claims. Queries are short, like search-engine queries. query_local is written in the local language; use an empty string for query_local and an empty list for local_languages if the question is not mainly about a non-English-speaking country.
+            """
+        )
+        text = await self.get_llm("default", "llm").invoke(prompt)
+        plan = self._extract_json(text)
+        claims = [
+            c
+            for c in plan.get("claims", [])
+            if isinstance(c, dict) and str(c.get("claim", "")).strip()
+        ][: self._max_claims]
+        if not claims:
+            raise ValueError("claim plan contained no claims")
+        languages = [
+            str(lang).strip()
+            for lang in plan.get("local_languages", []) or []
+            if str(lang).strip() and str(lang).strip().lower() != "english"
+        ][:2]
+        return {"countries": plan.get("countries", []), "local_languages": languages, "claims": claims}
+
+    async def _search_claim(self, claim: str, query: str, language: str | None) -> str:
+        today = datetime.now().strftime("%Y-%m-%d")
+        if language:
+            scope = (
+                f"Search sources written in {language} (local media, government and official sites, "
+                f"statistics offices, courts) using the query below, and answer in English."
+            )
+        else:
+            scope = "Search the web using the query below."
+        prompt = clean_indents(
+            f"""
+            You are a fact-checker. Today is {today}. {scope}
+
+            Claim to check: {claim}
+            Search query: {query}
+
+            Report only what the sources say: the key facts with their dates, and for each source its name and type (official/primary document, statistics or court record; wire or news report; commentary or opinion). Say explicitly if you found nothing relevant or if sources conflict. Do not make a forecast.
+            """
+        )
+        return await self.get_llm("researcher", "llm").invoke(prompt)
+
+    async def _fact_check_research(self, question: MetaculusQuestion) -> str:
+        async with self._concurrency_limiter:
+            plan = await self._plan_claims(question)
+            languages = plan["local_languages"]
+
+            jobs: list[tuple[int, str, str, str | None]] = []
+            for i, c in enumerate(plan["claims"], start=1):
+                claim = str(c["claim"]).strip()
+                jobs.append((i, claim, str(c.get("query_en") or claim).strip(), None))
+                local_query = str(c.get("query_local") or "").strip()
+                if languages and local_query:
+                    jobs.append((i, claim, local_query, languages[0]))
+            jobs = jobs[: self._max_searches]
+
+            semaphore = asyncio.Semaphore(self._search_concurrency)
+
+            async def run_job(job: tuple[int, str, str, str | None]) -> str:
+                async with semaphore:
+                    try:
+                        return await self._search_claim(job[1], job[2], job[3])
+                    except Exception as e:  # one failed search shouldn't sink the question
+                        return f"[search failed: {type(e).__name__}]"
+
+            results = await asyncio.gather(*(run_job(j) for j in jobs))
+            if all(r.startswith("[search failed") for r in results):
+                raise RuntimeError("all fact-check searches failed")
+
+            findings = []
+            for (i, claim, query, language), result in zip(jobs, results):
+                label = f"{language} sources" if language else "English sources"
+                findings.append(
+                    f"### Claim {i}: {claim}\n[{label}; query: {query}]\n{result[:2500]}"
+                )
+            findings_text = "\n\n".join(findings)
+
+            today = datetime.now().strftime("%Y-%m-%d")
+            local_note = (
+                f"The search included local-language ({', '.join(languages)}) sources."
+                if languages
+                else "No local-language search was needed."
+            )
+            prompt = clean_indents(
+                f"""
+                You are the verification editor of a fact-checking desk. Today is {today}.
+
+                {self._question_brief(question)}
+
+                Below are search findings for the claims this question hinges on. {local_note}
+
+                {findings_text}
+
+                Write a FACT SHEET for a forecaster, in English, with these sections:
+                1. Claims: for each claim, a verdict (CONFIRMED / CONTRADICTED / UNVERIFIED), one line of evidence with dates, and the best source with its type. Rank sources: official/primary documents and statistics above wire and news reports above commentary. If sources conflict, say so and prefer the more authoritative and more recent one.
+                2. Status quo today: what happens if nothing changes before the resolution date.
+                3. Scheduled events before resolution that could change the outcome, with dates.
+                4. Resolution-criteria notes: fine-print details that could trip up a forecaster.
+                5. Local vs English-language coverage: what local sources add or contradict (write "n/a" if there was no local search).
+                Use only the findings above and mark anything unsupported as UNVERIFIED. Do not give a probability.
+                """
+            )
+            fact_sheet = await self.get_llm("default", "llm").invoke(prompt)
+
+            abridged = findings_text[:3000]
+            research = (
+                f"{fact_sheet}\n\n---\nRaw search notes (abridged):\n{abridged}"
+            )
+            logger.info(f"Fact-check research for URL {question.page_url}:\n{research}")
+            return research
+
+    async def _template_research(self, question: MetaculusQuestion) -> str:
         async with self._concurrency_limiter:
             research = ""
             researcher = self.get_llm("researcher")
@@ -214,6 +391,7 @@ class SummerTemplateBot2026(ForecastBot):
             (b) The status quo outcome if nothing changed.
             (c) A brief description of a scenario that results in a No outcome.
             (d) A brief description of a scenario that results in a Yes outcome.
+            (e) The strongest case for the outcome you currently consider less likely (steelman it), and whether it should move your estimate.
 
             You write your rationale remembering that good forecasters put extra weight on the status quo outcome since the world changes slowly most of the time.
             {self._get_conditional_disclaimer_if_necessary(question)}
@@ -276,6 +454,7 @@ class SummerTemplateBot2026(ForecastBot):
             (a) The time left until the outcome to the question is known.
             (b) The status quo outcome if nothing changed.
             (c) A description of an scenario that results in an unexpected outcome.
+            (d) The strongest case for an option you currently rate low (steelman it), and whether it should move your probabilities.
 
             {self._get_conditional_disclaimer_if_necessary(question)}
             You write your rationale remembering that (1) good forecasters put extra weight on the status quo outcome since the world changes slowly most of the time, and (2) good forecasters leave some moderate probability on most options to account for unexpected outcomes.
@@ -364,6 +543,7 @@ class SummerTemplateBot2026(ForecastBot):
             (d) The expectations of experts and markets.
             (e) A brief description of an unexpected scenario that results in a low outcome.
             (f) A brief description of an unexpected scenario that results in a high outcome.
+            (g) The strongest case that the outcome lands outside your central range (steelman it), and whether it should widen your distribution.
 
             {self._get_conditional_disclaimer_if_necessary(question)}
             You remind yourself that good forecasters are humble and set wide 90/10 confidence intervals to account for unknown unknowns.
@@ -457,6 +637,7 @@ class SummerTemplateBot2026(ForecastBot):
             (d) The expectations of experts and markets.
             (e) A brief description of an unexpected scenario that results in a low outcome.
             (f) A brief description of an unexpected scenario that results in a high outcome.
+            (g) The strongest case that the outcome lands outside your central range (steelman it), and whether it should widen your distribution.
 
             {self._get_conditional_disclaimer_if_necessary(question)}
             You remind yourself that good forecasters are humble and set wide 90/10 confidence intervals to account for unknown unknowns.
@@ -709,6 +890,7 @@ if __name__ == "__main__":
         extra_metadata_in_explanation=True,
         llms=chosen_llms,
     )
+    template_bot.use_fact_check_research = has_strong_llm
 
     # Fall 2026 FutureEval seasonal tournament (28 Sep 2026 - 6 Jan 2027).
     # The pinned forecasting-tools version still points CURRENT_AI_COMPETITION_ID
