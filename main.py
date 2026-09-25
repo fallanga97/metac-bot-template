@@ -8,6 +8,7 @@ from datetime import datetime, timezone
 from typing import Literal
 
 import dotenv
+import requests
 
 # Runtime helpers (env validation, banners, dependency-warning suppression).
 from bot_helpers import (
@@ -46,6 +47,55 @@ from forecasting_tools import (
 
 dotenv.load_dotenv()
 logger = logging.getLogger(__name__)
+
+
+# ---- Market Pulse (bot-eligible, ~$7k per quarter) — Tom's addition ---------
+# Market Pulse tournaments use slugs like "market-pulse-26q3". The bot checks the
+# current and the next quarter, so a new round is picked up as soon as it opens.
+def market_pulse_slugs(today: datetime | None = None) -> list[str]:
+    today = today or datetime.now(timezone.utc)
+    quarter = (today.month - 1) // 3 + 1
+    year = today.year % 100
+    next_quarter = quarter % 4 + 1
+    next_year = (year + 1) % 100 if quarter == 4 else year
+    return [
+        f"market-pulse-{year:02d}q{quarter}",
+        f"market-pulse-{next_year:02d}q{next_quarter}",
+    ]
+
+
+def tournament_has_open_questions(client: MetaculusClient, slug: str) -> bool:
+    """One quick request without retries, so a round that hasn't launched yet
+    (or doesn't exist) doesn't slow down every 20-minute run."""
+    try:
+        response = requests.get(
+            f"{client.base_url}/posts/",
+            params={"tournaments": slug, "statuses": "open", "limit": 1},
+            timeout=30,
+            **client._get_auth_headers(),
+        )
+        return response.status_code == 200 and bool(response.json().get("results"))
+    except Exception as e:
+        logger.info(f"Could not check tournament {slug}: {type(e).__name__}")
+        return False
+
+
+def forecast_on_all_prize_tournaments(bot, client: MetaculusClient, seasonal_tournament: str) -> list:
+    reports = []
+    reports += asyncio.run(
+        bot.forecast_on_tournament(seasonal_tournament, return_exceptions=True)
+    )
+    reports += asyncio.run(
+        bot.forecast_on_tournament(client.CURRENT_MINIBENCH_ID, return_exceptions=True)
+    )
+    for slug in market_pulse_slugs():
+        if tournament_has_open_questions(client, slug):
+            reports += asyncio.run(
+                bot.forecast_on_tournament(slug, return_exceptions=True)
+            )
+        else:
+            print(f"ℹ️  Market Pulse '{slug}': no open questions (or not launched yet).")
+    return reports
 
 
 class SummerTemplateBot2026(ForecastBot):
@@ -921,17 +971,10 @@ if __name__ == "__main__":
             )
             forecast_reports = []
         else:
-            seasonal_tournament_reports = asyncio.run(
-                template_bot.forecast_on_tournament(
-                    FALL_2026_TOURNAMENT, return_exceptions=True
-                )
+            # Seasonal FutureEval tournament + MiniBench + Market Pulse
+            forecast_reports = forecast_on_all_prize_tournaments(
+                template_bot, client, FALL_2026_TOURNAMENT
             )
-            minibench_reports = asyncio.run(
-                template_bot.forecast_on_tournament(
-                    client.CURRENT_MINIBENCH_ID, return_exceptions=True
-                )
-            )
-            forecast_reports = seasonal_tournament_reports + minibench_reports
     elif run_mode == "metaculus_cup":
         # The Metaculus Cup may be uninitialized near the start of a season
         # (Jan/May/Sep). AXC_2025_TOURNAMENT_ID = 32564 and
