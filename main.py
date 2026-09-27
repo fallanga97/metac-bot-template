@@ -2,6 +2,7 @@ import argparse
 import asyncio
 import json
 import logging
+import sys
 import re
 from datetime import datetime, timezone
 from typing import Literal
@@ -44,8 +45,17 @@ from forecasting_tools import (
     structure_output,
 )
 
-# Free-tier models (Mistral, GitHub Models, Groq) and keyless news search - Tom's addition, Fall 2026
-from free_tier import build_free_llms, free_news_search
+# Free-tier models (Mistral, Groq, optional Gemini) and keyless news search - Tom's addition, Fall 2026
+from free_tier import (
+    build_free_llms,
+    free_model_report,
+    free_news_search,
+    note,
+    read_binary,
+    read_options,
+    read_percentiles,
+)
+from forecasting_tools import PredictedOption
 
 dotenv.load_dotenv()
 logger = logging.getLogger(__name__)
@@ -183,7 +193,18 @@ class SummerTemplateBot2026(ForecastBot):
         1  # Set this to whatever works for your search-provider/ai-model rate limits
     )
     _concurrency_limiter = asyncio.Semaphore(_max_concurrent_questions)
-    _structure_output_validation_samples = 2
+    _structure_output_validation_samples = 1  # free tiers: one parser call, and usually none (answers are read directly)
+    _question_limiters: dict = {}
+
+    async def _run_individual_question_with_error_propagation(self, question):
+        # Free tiers: one question at a time from start to finish, so the rate
+        # limits are shared by as few calls as possible.
+        loop = asyncio.get_running_loop()
+        limiter = self._question_limiters.get(loop)
+        if limiter is None:
+            limiter = self._question_limiters[loop] = asyncio.Semaphore(1)
+        async with limiter:
+            return await super()._run_individual_question_with_error_propagation(question)
 
     ##################################### RESEARCH #####################################
 
@@ -206,7 +227,32 @@ class SummerTemplateBot2026(ForecastBot):
         # free forecasters' daily quotas are kept for the forecasts themselves.
         defaults = super()._llm_config_defaults()
         defaults["writer"] = defaults["default"]
+        defaults["web"] = None  # optional: one web search per question (Groq browser_search)
         return defaults
+
+    async def _web_overview(self, question: MetaculusQuestion) -> str:
+        """One web search for the whole question (Groq gpt-oss browser_search).
+        Returns "" when there is no web-search model or it fails."""
+        web = self._llms.get("web")
+        if web is None:
+            return ""
+        today = datetime.now().strftime("%Y-%m-%d")
+        prompt = clean_indents(
+            f"""
+            Today is {today}. Search the web for the most recent, most relevant facts for this forecasting question and report them briefly with dates and source names. Do not make a forecast.
+
+            Question: {question.question_text}
+            Resolution criteria: {(question.resolution_criteria or "")[:1500]}
+            """
+        )
+        try:
+            result = await web.invoke(prompt)
+            note("web searches (Groq browser_search) with results")
+            return result
+        except Exception as e:
+            note("web searches (Groq browser_search) failed")
+            logger.info(f"Web search failed for {question.page_url}: {type(e).__name__}")
+            return ""
 
     async def run_research(self, question: MetaculusQuestion) -> str:
         if self.use_fact_check_research:
@@ -335,8 +381,9 @@ class SummerTemplateBot2026(ForecastBot):
                     except Exception as e:  # one failed search shouldn't sink the question
                         return f"[search failed: {type(e).__name__}]"
 
-            results = await asyncio.gather(*(run_job(j) for j in jobs))
-            if all(r.startswith("[search failed") for r in results):
+            gathered = await asyncio.gather(self._web_overview(question), *(run_job(j) for j in jobs))
+            web_overview, results = gathered[0], list(gathered[1:])
+            if all(r.startswith("[search failed") for r in results) and not web_overview:
                 raise RuntimeError("all fact-check searches failed")
 
             findings = []
@@ -345,6 +392,8 @@ class SummerTemplateBot2026(ForecastBot):
                 findings.append(
                     f"### Claim {i}: {claim}\n[{label}; query: {query}]\n{result[:2500]}"
                 )
+            if web_overview:
+                findings.insert(0, f"### Web search overview (whole question)\n{web_overview[:4000]}")
             findings_text = "\n\n".join(findings)
 
             today = datetime.now().strftime("%Y-%m-%d")
@@ -410,7 +459,9 @@ class SummerTemplateBot2026(ForecastBot):
                     logger.info(f"Web-search model failed ({type(e).__name__}); using keyless news search instead.")
                     research = await free_news_search(question.question_text)
             elif researcher == "free-news":
-                research = await free_news_search(question.question_text)
+                overview = await self._web_overview(question)
+                headlines = await free_news_search(question.question_text)
+                research = (overview + "\n\n" + headlines).strip()
             elif (
                 researcher == "asknews/news-summaries"
                 or researcher == "asknews/deep-research/low-depth"
@@ -487,12 +538,18 @@ class SummerTemplateBot2026(ForecastBot):
     ) -> ReasonedPrediction[float]:
         reasoning = await self.get_llm("default", "llm").invoke(prompt)
         logger.info(f"Reasoning for URL {question.page_url}: {reasoning}")
-        binary_prediction: BinaryPrediction = await structure_output(
-            reasoning,
-            BinaryPrediction,
-            model=self.get_llm("parser", "llm"),
-            num_validation_samples=self._structure_output_validation_samples,
-        )
+        direct = read_binary(reasoning)  # "Probability: NN%" at the end: no parser call needed
+        if direct is not None:
+            note("answers read directly")
+            binary_prediction = BinaryPrediction(prediction_in_decimal=direct)
+        else:
+            note("answers read by the parser model")
+            binary_prediction = await structure_output(
+                reasoning,
+                BinaryPrediction,
+                model=self.get_llm("parser", "llm"),
+                num_validation_samples=self._structure_output_validation_samples,
+            )
         decimal_pred = max(0.01, min(0.99, binary_prediction.prediction_in_decimal))
 
         logger.info(
@@ -562,13 +619,21 @@ class SummerTemplateBot2026(ForecastBot):
         )
         reasoning = await self.get_llm("default", "llm").invoke(prompt)
         logger.info(f"Reasoning for URL {question.page_url}: {reasoning}")
-        predicted_option_list: PredictedOptionList = await structure_output(
-            text_to_structure=reasoning,
-            output_type=PredictedOptionList,
-            model=self.get_llm("parser", "llm"),
-            num_validation_samples=self._structure_output_validation_samples,
-            additional_instructions=parsing_instructions,
-        )
+        direct = read_options(reasoning, list(question.options))
+        if direct is not None:
+            note("answers read directly")
+            predicted_option_list = PredictedOptionList(
+                predicted_options=[PredictedOption(option_name=o, probability=p) for o, p in direct.items()]
+            )
+        else:
+            note("answers read by the parser model")
+            predicted_option_list = await structure_output(
+                text_to_structure=reasoning,
+                output_type=PredictedOptionList,
+                model=self.get_llm("parser", "llm"),
+                num_validation_samples=self._structure_output_validation_samples,
+                additional_instructions=parsing_instructions,
+            )
 
         logger.info(
             f"Forecasted URL {question.page_url} with prediction: {predicted_option_list}."
@@ -659,18 +724,35 @@ class SummerTemplateBot2026(ForecastBot):
             - Turn any values that are in scientific notation into regular numbers.
             """
         )
-        percentile_list: list[Percentile] = await structure_output(
-            reasoning,
-            list[Percentile],
-            model=self.get_llm("parser", "llm"),
-            additional_instructions=parsing_instructions,
-            num_validation_samples=self._structure_output_validation_samples,
-        )
+        direct = read_percentiles(reasoning)
+        if direct is not None and self._plausible_for_question(list(direct.values()), question):
+            note("answers read directly")
+            percentile_list = [Percentile(percentile=p / 100, value=v) for p, v in sorted(direct.items())]
+        else:
+            note("answers read by the parser model")
+            percentile_list = await structure_output(
+                reasoning,
+                list[Percentile],
+                model=self.get_llm("parser", "llm"),
+                additional_instructions=parsing_instructions,
+                num_validation_samples=self._structure_output_validation_samples,
+            )
         prediction = NumericDistribution.from_question(percentile_list, question)
         logger.info(
             f"Forecasted URL {question.page_url} with prediction: {prediction.declared_percentiles}."
         )
         return ReasonedPrediction(prediction_value=prediction, reasoning=reasoning)
+
+    @staticmethod
+    def _plausible_for_question(values: list[float], question: NumericQuestion) -> bool:
+        """Numbers read directly are only used when they sit near the question's
+        range; otherwise they may be in other units, and the parser model (which
+        converts units) reads them instead."""
+        lo, hi = question.lower_bound, question.upper_bound
+        if lo is None or hi is None:
+            return True
+        span = max(hi - lo, 1e-9)
+        return all(lo - 2 * span <= v <= hi + 2 * span for v in values)
 
     ##################################### DATE QUESTIONS #####################################
 
@@ -929,8 +1011,8 @@ if __name__ == "__main__":
 
     # ---- Tom's configuration (Fall 2026): free tiers only ---------------------
     # Metaculus declined the LLM-credit request, so the bot uses free tiers:
-    # Mistral (MISTRAL_API_KEY), GitHub Models (the workflow's own GITHUB_TOKEN,
-    # passed as GITHUB_API_KEY) and Groq (GROQ_API_KEY). See free_tier.py.
+    # Mistral (MISTRAL_API_KEY), Groq (GROQ_API_KEY) and, optionally, Google
+    # Gemini (GEMINI_API_KEY). See free_tier.py for the limits of each.
     chosen_llms, free_providers = build_free_llms()
     if free_providers:
         print(f"🆓  Free models from: {', '.join(free_providers)}\n")
@@ -944,6 +1026,7 @@ if __name__ == "__main__":
         skip_previously_forecasted_questions=True,
         extra_metadata_in_explanation=True,
         llms=chosen_llms,
+        enable_summarize_research=False,  # free tiers: saves one model call per question
     )
     template_bot.use_fact_check_research = chosen_llms is not None
 
@@ -968,8 +1051,8 @@ if __name__ == "__main__":
     if run_mode == "tournament":
         if chosen_llms is None:
             print(
-                "⏸️  No free model keys found (MISTRAL_API_KEY, GROQ_API_KEY) and GitHub Models\n"
-                "    is not enabled - skipping tournament forecasts.\n"
+                "⏸️  No free model keys found (MISTRAL_API_KEY, GROQ_API_KEY, GEMINI_API_KEY)\n"
+                "    - skipping tournament forecasts.\n"
                 "    Add the keys under Settings -> Secrets and variables -> Actions.\n"
             )
             forecast_reports = []
@@ -999,9 +1082,15 @@ if __name__ == "__main__":
             )
         )
 
-    template_bot.log_report_summary(forecast_reports)
+    template_bot.log_report_summary(forecast_reports, raise_errors=False)
     print_run_summary_banner(
         forecast_reports,
         will_publish=publish_to_metaculus,
         tournament_url=TOURNAMENT_URLS.get(run_mode),
     )
+    # A short report of what each free model did: the last lines of the log
+    print(free_model_report())
+    failures = [r for r in forecast_reports if isinstance(r, BaseException)]
+    if failures:
+        print(f"❌  {len(failures)} of {len(forecast_reports)} question(s) failed (details above).")
+        sys.exit(1)
