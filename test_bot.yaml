@@ -1,0 +1,61 @@
+name: Test Bot
+
+on:
+  workflow_dispatch:
+
+# Add concurrency group to prevent parallel runs
+concurrency:
+  group: ${{ github.workflow }}
+  cancel-in-progress: false
+
+# GitHub Models (free GPT-4.1) uses this workflow's own token; it needs "models: read".
+permissions:
+  contents: read
+  models: read
+
+
+# Daily job to run the simple forecast bot
+jobs:
+  forecast_job:
+    runs-on: ubuntu-latest # determines the machine that will run the job - keep as is
+    steps: # sets up the steps that will be run in order
+      # setup repository with all necessary dependencies - keep as is
+      - name: Check out repository
+        uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install poetry
+        uses: snok/install-poetry@v1
+        with:
+          virtualenvs-create: true
+          virtualenvs-in-project: true
+          installer-parallel: true
+      # Adding the below will make the workflow faster, but will mean you don't automatically get updates from forecasting-tools and other packages
+      # - name: Load cached venv
+      #   id: cached-poetry-dependencies
+      #   uses: actions/cache@v4
+      #   with:
+      #     path: .venv
+      #     key: venv-${{ runner.os }}-${{ steps.setup-python.outputs.python-version }}-${{ hashFiles('**/poetry.lock') }}
+      - name: Install dependencies
+        run: poetry install --no-interaction --no-root
+      - name: Run bot
+        run: |
+          poetry run python main.py --mode test_questions
+        # this reads the environment variables from the github repository.
+        # Store under Settings --> Secrets and variables --> Actions
+        env:
+          METACULUS_TOKEN: ${{ secrets.METACULUS_TOKEN }} # replace this with the name of the variable under which you stored your own Metaculus token
+          PERPLEXITY_API_KEY: ${{ secrets.PERPLEXITY_API_KEY }}
+          EXA_API_KEY: ${{ secrets.EXA_API_KEY }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          ASKNEWS_CLIENT_ID: ${{ secrets.ASKNEWS_CLIENT_ID }}
+          ASKNEWS_SECRET: ${{ secrets.ASKNEWS_SECRET }}
+          # Free tiers (Tom's setup, Fall 2026)
+          MISTRAL_API_KEY: ${{ secrets.MISTRAL_API_KEY }}
+          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+          GITHUB_API_KEY: ${{ secrets.GITHUB_TOKEN }} # GitHub Models, no extra secret needed
+          GITHUB_API_BASE: https://models.github.ai/inference

@@ -2,7 +2,6 @@ import argparse
 import asyncio
 import json
 import logging
-import os
 import re
 from datetime import datetime, timezone
 from typing import Literal
@@ -45,6 +44,9 @@ from forecasting_tools import (
     structure_output,
 )
 
+# Free-tier models (Mistral, GitHub Models, Groq) and keyless news search - Tom's addition, Fall 2026
+from free_tier import build_free_llms, free_news_search
+
 dotenv.load_dotenv()
 logger = logging.getLogger(__name__)
 
@@ -81,21 +83,22 @@ def tournament_has_open_questions(client: MetaculusClient, slug: str) -> bool:
 
 
 def forecast_on_all_prize_tournaments(bot, client: MetaculusClient, seasonal_tournament: str) -> list:
-    reports = []
-    reports += asyncio.run(
-        bot.forecast_on_tournament(seasonal_tournament, return_exceptions=True)
-    )
-    reports += asyncio.run(
-        bot.forecast_on_tournament(client.CURRENT_MINIBENCH_ID, return_exceptions=True)
-    )
-    for slug in market_pulse_slugs():
-        if tournament_has_open_questions(client, slug):
-            reports += asyncio.run(
-                bot.forecast_on_tournament(slug, return_exceptions=True)
-            )
-        else:
-            print(f"ℹ️  Market Pulse '{slug}': no open questions (or not launched yet).")
-    return reports
+    # All tournaments run in ONE event loop. The bot's class-level semaphore is
+    # tied to the first loop that waits on it, so a second asyncio.run() made
+    # every question after the first fail with "bound to a different event loop"
+    # whenever two or more new questions arrived at once.
+    async def run_all() -> list:
+        reports = []
+        reports += await bot.forecast_on_tournament(seasonal_tournament, return_exceptions=True)
+        reports += await bot.forecast_on_tournament(client.CURRENT_MINIBENCH_ID, return_exceptions=True)
+        for slug in market_pulse_slugs():
+            if tournament_has_open_questions(client, slug):
+                reports += await bot.forecast_on_tournament(slug, return_exceptions=True)
+            else:
+                print(f"ℹ️  Market Pulse '{slug}': no open questions (or not launched yet).")
+        return reports
+
+    return asyncio.run(run_all())
 
 
 class SummerTemplateBot2026(ForecastBot):
@@ -192,10 +195,18 @@ class SummerTemplateBot2026(ForecastBot):
     #    the forecaster a fact sheet with CONFIRMED / CONTRADICTED / UNVERIFIED
     #    verdicts instead of raw search results.
     # Any failure falls back to the original template research below.
-    use_fact_check_research: bool = False  # switched on in __main__ when strong LLMs are configured
+    use_fact_check_research: bool = False  # switched on in __main__ when a free writer model is configured
     _max_claims = 4
     _max_searches = 8
-    _search_concurrency = 4
+    _search_concurrency = 2  # free-tier search limits
+
+    @classmethod
+    def _llm_config_defaults(cls) -> dict:
+        # "writer" drafts research plans and fact sheets (long prompts), so the
+        # free forecasters' daily quotas are kept for the forecasts themselves.
+        defaults = super()._llm_config_defaults()
+        defaults["writer"] = defaults["default"]
+        return defaults
 
     async def run_research(self, question: MetaculusQuestion) -> str:
         if self.use_fact_check_research:
@@ -253,7 +264,7 @@ class SummerTemplateBot2026(ForecastBot):
             Rules: at most {self._max_claims} claims. Queries are short, like search-engine queries. query_local is written in the local language; use an empty string for query_local and an empty list for local_languages if the question is not mainly about a non-English-speaking country.
             """
         )
-        text = await self.get_llm("default", "llm").invoke(prompt)
+        text = await self.get_llm("writer", "llm").invoke(prompt)
         plan = self._extract_json(text)
         claims = [
             c
@@ -269,7 +280,9 @@ class SummerTemplateBot2026(ForecastBot):
         ][:2]
         return {"countries": plan.get("countries", []), "local_languages": languages, "claims": claims}
 
-    async def _search_claim(self, claim: str, query: str, language: str | None) -> str:
+    async def _search_claim(
+        self, claim: str, query: str, language: str | None, english_query: str | None = None
+    ) -> str:
         today = datetime.now().strftime("%Y-%m-%d")
         if language:
             scope = (
@@ -288,28 +301,37 @@ class SummerTemplateBot2026(ForecastBot):
             Report only what the sources say: the key facts with their dates, and for each source its name and type (official/primary document, statistics or court record; wire or news report; commentary or opinion). Say explicitly if you found nothing relevant or if sources conflict. Do not make a forecast.
             """
         )
-        return await self.get_llm("researcher", "llm").invoke(prompt)
+        researcher = self.get_llm("researcher")
+        if isinstance(researcher, GeneralLlm):
+            try:
+                return await researcher.invoke(prompt)
+            except Exception as e:
+                logger.info(f"Web-search model failed ({type(e).__name__}); using keyless news search instead.")
+        # Keyless fallback: recent headlines from GDELT (it indexes non-English
+        # articles in English translation, so the English query plus a language filter)
+        return await free_news_search(english_query or query, language)
 
     async def _fact_check_research(self, question: MetaculusQuestion) -> str:
         async with self._concurrency_limiter:
             plan = await self._plan_claims(question)
             languages = plan["local_languages"]
 
-            jobs: list[tuple[int, str, str, str | None]] = []
+            jobs: list[tuple[int, str, str, str | None, str]] = []
             for i, c in enumerate(plan["claims"], start=1):
                 claim = str(c["claim"]).strip()
-                jobs.append((i, claim, str(c.get("query_en") or claim).strip(), None))
+                query_en = str(c.get("query_en") or claim).strip()
+                jobs.append((i, claim, query_en, None, query_en))
                 local_query = str(c.get("query_local") or "").strip()
                 if languages and local_query:
-                    jobs.append((i, claim, local_query, languages[0]))
+                    jobs.append((i, claim, local_query, languages[0], query_en))
             jobs = jobs[: self._max_searches]
 
             semaphore = asyncio.Semaphore(self._search_concurrency)
 
-            async def run_job(job: tuple[int, str, str, str | None]) -> str:
+            async def run_job(job: tuple[int, str, str, str | None, str]) -> str:
                 async with semaphore:
                     try:
-                        return await self._search_claim(job[1], job[2], job[3])
+                        return await self._search_claim(job[1], job[2], job[3], job[4])
                     except Exception as e:  # one failed search shouldn't sink the question
                         return f"[search failed: {type(e).__name__}]"
 
@@ -318,7 +340,7 @@ class SummerTemplateBot2026(ForecastBot):
                 raise RuntimeError("all fact-check searches failed")
 
             findings = []
-            for (i, claim, query, language), result in zip(jobs, results):
+            for (i, claim, query, language, _), result in zip(jobs, results):
                 label = f"{language} sources" if language else "English sources"
                 findings.append(
                     f"### Claim {i}: {claim}\n[{label}; query: {query}]\n{result[:2500]}"
@@ -350,7 +372,7 @@ class SummerTemplateBot2026(ForecastBot):
                 Use only the findings above and mark anything unsupported as UNVERIFIED. Do not give a probability.
                 """
             )
-            fact_sheet = await self.get_llm("default", "llm").invoke(prompt)
+            fact_sheet = await self.get_llm("writer", "llm").invoke(prompt)
 
             abridged = findings_text[:3000]
             research = (
@@ -382,7 +404,13 @@ class SummerTemplateBot2026(ForecastBot):
             )
 
             if isinstance(researcher, GeneralLlm):
-                research = await researcher.invoke(prompt)
+                try:
+                    research = await researcher.invoke(prompt)
+                except Exception as e:
+                    logger.info(f"Web-search model failed ({type(e).__name__}); using keyless news search instead.")
+                    research = await free_news_search(question.question_text)
+            elif researcher == "free-news":
+                research = await free_news_search(question.question_text)
             elif (
                 researcher == "asknews/news-summaries"
                 or researcher == "asknews/deep-research/low-depth"
@@ -899,36 +927,13 @@ if __name__ == "__main__":
     publish_to_metaculus = True
     print_startup_banner(run_mode, will_publish=publish_to_metaculus)
 
-    # ---- Tom's configuration (Fall 2026) ------------------------------------
-    # Strong models via OpenRouter once the free FutureEval credits key
-    # (OPENROUTER_API_KEY) is added as a GitHub secret. Without it, the bot
-    # falls back to the Metaculus LLM proxy (older, weaker models) and only
-    # runs the test mode — see the tournament gate below.
-    openrouter_key = os.getenv("OPENROUTER_API_KEY", "").strip()
-    has_strong_llm = openrouter_key not in ("", "REPLACE_ME")
-    if has_strong_llm:
-        chosen_llms = {
-            "default": GeneralLlm(
-                model="openrouter/anthropic/claude-sonnet-4.6",
-                temperature=0.3,
-                timeout=180,
-                allowed_tries=2,
-            ),
-            "summarizer": GeneralLlm(
-                model="openrouter/openai/gpt-4o-mini", temperature=0.3
-            ),
-            "researcher": GeneralLlm(
-                model="openrouter/perplexity/sonar-pro",
-                temperature=0.1,
-                timeout=180,
-                allowed_tries=2,
-            ),
-            "parser": GeneralLlm(
-                model="openrouter/openai/gpt-4o-mini", temperature=0.3
-            ),
-        }
-    else:
-        chosen_llms = None  # forecasting-tools defaults -> Metaculus LLM proxy
+    # ---- Tom's configuration (Fall 2026): free tiers only ---------------------
+    # Metaculus declined the LLM-credit request, so the bot uses free tiers:
+    # Mistral (MISTRAL_API_KEY), GitHub Models (the workflow's own GITHUB_TOKEN,
+    # passed as GITHUB_API_KEY) and Groq (GROQ_API_KEY). See free_tier.py.
+    chosen_llms, free_providers = build_free_llms()
+    if free_providers:
+        print(f"🆓  Free models from: {', '.join(free_providers)}\n")
 
     template_bot = SummerTemplateBot2026(
         research_reports_per_question=1,
@@ -940,7 +945,7 @@ if __name__ == "__main__":
         extra_metadata_in_explanation=True,
         llms=chosen_llms,
     )
-    template_bot.use_fact_check_research = has_strong_llm
+    template_bot.use_fact_check_research = chosen_llms is not None
 
     # Fall 2026 FutureEval seasonal tournament (28 Sep 2026 - 6 Jan 2027).
     # The pinned forecasting-tools version still points CURRENT_AI_COMPETITION_ID
@@ -961,13 +966,11 @@ if __name__ == "__main__":
     # summary printers below.
     client = MetaculusClient()
     if run_mode == "tournament":
-        if not has_strong_llm:
-            # A weak fallback model would likely score below the other bots,
-            # which hurts the tournament score more than skipping. Wait for
-            # the free OpenRouter credits key instead.
+        if chosen_llms is None:
             print(
-                "⏸️  OPENROUTER_API_KEY not set yet - skipping tournament forecasts.\n"
-                "    Add it under Settings -> Secrets and variables -> Actions.\n"
+                "⏸️  No free model keys found (MISTRAL_API_KEY, GROQ_API_KEY) and GitHub Models\n"
+                "    is not enabled - skipping tournament forecasts.\n"
+                "    Add the keys under Settings -> Secrets and variables -> Actions.\n"
             )
             forecast_reports = []
         else:

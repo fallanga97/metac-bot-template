@@ -70,13 +70,16 @@ def check_environment(strict: bool = True) -> None:
 
     has_llm_key = any(
         _is_real_env(k)
-        for k in ("OPENROUTER_API_KEY", "OPENAI_API_KEY", "ANTHROPIC_API_KEY")
+        for k in (
+            "MISTRAL_API_KEY", "GROQ_API_KEY", "GITHUB_API_KEY",  # free tiers (Tom's setup)
+            "OPENROUTER_API_KEY", "OPENAI_API_KEY", "ANTHROPIC_API_KEY",
+        )
     )
     if not has_llm_key:
         print(
-            "⚠️  No LLM key set (OPENROUTER/OPENAI/ANTHROPIC). The bot will fall back\n"
-            "    to the Metaculus LLM proxy. Free OpenRouter credits: "
-            "https://forms.gle/aQdYMq9Pisrf1v7d8\n"
+            "⚠️  No LLM key set. Add MISTRAL_API_KEY and GROQ_API_KEY as repository secrets\n"
+            "    (both have free tiers), and give the workflow 'models: read' permission\n"
+            "    for GitHub Models. Without any of them the bot falls back to the Metaculus LLM proxy.\n"
         )
 
     if problems:
