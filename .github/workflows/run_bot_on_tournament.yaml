@@ -10,6 +10,11 @@ concurrency:
   group: ${{ github.workflow }}
   cancel-in-progress: false
 
+# GitHub Models (free GPT-4.1) uses this workflow's own token; it needs "models: read".
+permissions:
+  contents: read
+  models: read
+
 
 # Daily job to run the simple forecast bot
 jobs:
@@ -51,3 +56,8 @@ jobs:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           ASKNEWS_CLIENT_ID: ${{ secrets.ASKNEWS_CLIENT_ID }}
           ASKNEWS_SECRET: ${{ secrets.ASKNEWS_SECRET }}
+          # Free tiers (Tom's setup, Fall 2026)
+          MISTRAL_API_KEY: ${{ secrets.MISTRAL_API_KEY }}
+          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+          GITHUB_API_KEY: ${{ secrets.GITHUB_TOKEN }} # GitHub Models, no extra secret needed
+          GITHUB_API_BASE: https://models.github.ai/inference
