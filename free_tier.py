@@ -2,12 +2,15 @@
 Free-tier models and news search for Tom's bot (Fall 2026, version 3).
 
 Metaculus declined the LLM-credit request, so the bot runs on free tiers only.
-Status checked on 27 Sep 2026, after two live test runs:
+Status checked on 27-30 Sep 2026, after three live test runs:
 
   Google Gemini, free tier (GEMINI_API_KEY) - strongly recommended
-      gemini-3.8-flash: about 20 requests/day; gemini-3.5-flash-lite and
-      gemini-3.1-flash-lite: several hundred requests/day each (developer
-      measurements; Google shows the exact numbers only in AI Studio).
+      gemini-3.8-flash, 3.7-flash and 3.6-flash (each with its own small
+      daily quota) forecast; gemini-3.5-flash-lite and 3.1-flash-lite
+      (larger quotas) write research notes, read answers and step in when
+      the others are out. Google shows the exact limits only in AI Studio.
+      At busy times the free tier answers 503 "high demand": that model then
+      rests for a few minutes and is tried again later in the run.
       Temperature stays at Gemini 3's default of 1.0, as Google recommends.
       Google Search grounding is not part of the free tier.
   Groq, free plan (GROQ_API_KEY)
@@ -15,9 +18,10 @@ Status checked on 27 Sep 2026, after two live test runs:
       8,000 tokens/minute and 200,000 tokens/day. A forecast uses ~7,000
       tokens and a web search (Groq's browser_search tool) ~12,000, so each
       model manages roughly 20-25 calls a day. Groq is kept for forecasts,
-      the web search and, as a last resort, reading answers; it no longer
-      writes research plans or fact sheets. qwen3.8-27b is not used: the
-      free plan allows it only 1,000 output tokens per minute.
+      the web search (gpt-oss-20b, then 120b when 20b's tokens run out) and,
+      as a last resort, reading answers; it doesn't write research notes.
+      qwen3.8-27b is not used: the free plan allows it only 1,000 output
+      tokens per minute.
   Mistral, free "Experiment" plan (MISTRAL_API_KEY)
       One request at a time. Mistral Large is not included. In the second
       test run every Mistral call was refused with "Rate limit exceeded";
@@ -147,7 +151,15 @@ _PROVIDER_ENDING_ERRORS = (
     "authenticationerror", "permissiondeniederror", "unauthorized", "invalid api key",
     "invalid_api_key", "forbidden",
 )
-MAX_CONSECUTIVE_FAILURES = 4  # per model, for errors other than rate limits
+# Temporary overload on the provider's side (HTTP 503 "high demand" and the
+# like): the model rests for a while and is tried again later in the run.
+_OVERLOAD_ERRORS = (
+    "serviceunavailableerror", "overloaded", "high demand", "over capacity", "capacity exceeded",
+    "temporarily unavailable",
+)
+FIRST_REST = 180.0  # seconds; doubles with every further overload, up to MAX_REST
+MAX_REST = 1800.0
+MAX_CONSECUTIVE_FAILURES = 4  # per model, for other errors
 # Rate limits are counted per provider (Mistral's apply to the whole account;
 # Groq's and Gemini's gates are per model anyway). Each one also spaces that
 # provider's requests further apart.
@@ -160,6 +172,10 @@ def _matches(error: BaseException, markers: tuple[str, ...]) -> bool:
     return any(marker in text for marker in markers)
 
 
+def _is_overload(error: BaseException) -> bool:
+    return _matches(error, _OVERLOAD_ERRORS)
+
+
 def _is_rate_limit(error: BaseException) -> bool:
     if _matches(error, ("request too large", "reduce your message size")):
         return False  # Groq reports an oversized prompt as a rate limit; waiting won't help
@@ -170,10 +186,18 @@ def _is_rate_limit(error: BaseException) -> bool:
 class ModelStats:
     ok: int = 0
     failed: int = 0
-    consecutive_failures: int = 0
+    consecutive_failures: int = 0  # any error
+    errors_in_a_row: int = 0  # errors that are neither limits nor overloads
+    overloads: int = 0
+    overloads_in_a_row: int = 0
+    rests: int = 0
+    resting_until: float = 0.0  # time.monotonic()
     skipped_because: str | None = None
     quota_used_up: bool = False
     last_error: str = ""
+
+    def resting(self) -> bool:
+        return time.monotonic() < self.resting_until
 
 
 STATS: dict[str, ModelStats] = {}
@@ -185,23 +209,27 @@ def note(key: str) -> None:
     NOTES[key] = NOTES.get(key, 0) + 1
 
 
-def free_model_report() -> str:
+def free_model_report(verdict: str | None = None) -> str:
     lines = ["=" * 30 + " Free-model report " + "=" * 30]
     if not STATS:
         lines.append("No model was called in this run.")
     for model, st in sorted(STATS.items()):
         line = f"{model:<36} ok {st.ok:>3}   failed {st.failed:>3}"
+        if st.overloads:
+            line += f"   busy (503) x{st.overloads}"
         gate = MODEL_GATES.get(model)
         if st.skipped_because:
             label = "DAILY QUOTA USED UP" if st.quota_used_up else "SKIPPED"
             line += f"   {label}: {st.skipped_because}"
         elif gate is not None and gate.disabled_reason:
             line += f"   SKIPPED ({gate.name}): {gate.disabled_reason}"
-        elif st.last_error:
+        elif st.last_error and st.consecutive_failures:
             line += f"   last error: {st.last_error}"
         lines.append(line)
     for key, n in sorted(NOTES.items()):
         lines.append(f"{key}: {n}")
+    if verdict:
+        lines.append(verdict)
     lines.append("=" * 79)
     return "\n".join(lines)
 
@@ -242,12 +270,18 @@ class FreeTierLlm(GeneralLlm):
         return STATS.setdefault(self.model, ModelStats())
 
     def unavailable_reason(self) -> str | None:
+        """Why this model is out for the rest of the run, if it is."""
         return self._gate.disabled_reason or self.stats.skipped_because
 
-    def can_take(self, prompt: Any) -> bool:
-        if self.unavailable_reason():
-            return False
+    def resting(self) -> bool:
+        """Out for a few minutes after the provider said it's overloaded."""
+        return self.stats.resting()
+
+    def fits(self, prompt: Any) -> bool:
         return self._max_input_tokens is None or estimate_tokens(prompt) <= self._max_input_tokens
+
+    def can_take(self, prompt: Any) -> bool:
+        return not self.unavailable_reason() and not self.resting() and self.fits(prompt)
 
     def _record_failure(self, e: Exception) -> None:
         st = self.stats
@@ -261,6 +295,17 @@ class FreeTierLlm(GeneralLlm):
             st.skipped_because = note_text
             st.quota_used_up = True
             logger.warning(f"{self.model}: {note_text} - daily quota used up, skipping this model for the rest of the run")
+        elif _is_overload(e):
+            st.overloads += 1
+            st.overloads_in_a_row += 1
+            if st.overloads_in_a_row >= 2:
+                rest = min(MAX_REST, FIRST_REST * 2 ** st.rests)
+                st.rests += 1
+                st.overloads_in_a_row = 0
+                st.resting_until = time.monotonic() + rest
+                logger.warning(f"{self.model}: {note_text} - provider busy, resting this model for {rest / 60:.0f} min")
+            else:
+                logger.warning(f"{self.model}: {note_text}")
         elif _matches(e, _GONE_ERRORS):
             st.skipped_because = note_text
             logger.warning(f"{self.model}: {note_text} - skipping this model for the rest of the run")
@@ -275,17 +320,21 @@ class FreeTierLlm(GeneralLlm):
             else:
                 logger.warning(f"{self.model}: {note_text}")
                 gate.slow_down()
-        elif st.consecutive_failures >= MAX_CONSECUTIVE_FAILURES:
-            st.skipped_because = f"{st.consecutive_failures} failures in a row; last: {note_text}"
-            logger.warning(f"{self.model}: {st.skipped_because} - skipping this model for the rest of the run")
         else:
-            logger.warning(f"{self.model}: {note_text}")
+            st.errors_in_a_row += 1
+            if st.errors_in_a_row >= MAX_CONSECUTIVE_FAILURES:
+                st.skipped_because = f"{st.errors_in_a_row} failures in a row; last: {note_text}"
+                logger.warning(f"{self.model}: {st.skipped_because} - skipping this model for the rest of the run")
+            else:
+                logger.warning(f"{self.model}: {note_text}")
 
     async def _mockable_direct_call_to_model(self, prompt):  # type: ignore[override]
         for attempt in range(1, self._tries + 1):
             reason = self.unavailable_reason()
             if reason:
                 raise _Skipped(f"{self.model} skipped for this run: {reason}")
+            if self.resting():
+                raise _Skipped(f"{self.model} is resting after the provider reported an overload")
             try:
                 async with self._gate.slot():
                     reason = self.unavailable_reason()  # may have changed while waiting for the slot
@@ -296,12 +345,13 @@ class FreeTierLlm(GeneralLlm):
                 raise
             except Exception as e:
                 self._record_failure(e)
-                if attempt == self._tries or self.unavailable_reason():
+                if attempt == self._tries or self.unavailable_reason() or self.resting():
                     raise
                 await asyncio.sleep(RETRY_WAIT * attempt)
                 continue
-            self.stats.ok += 1
-            self.stats.consecutive_failures = 0
+            st = self.stats
+            st.ok += 1
+            st.consecutive_failures = st.errors_in_a_row = st.overloads_in_a_row = 0
             self._gate.rate_limits_in_a_row = 0
             return result
         raise AssertionError("unreachable")
@@ -333,17 +383,22 @@ class FreeModelMix(GeneralLlm):
         self._next = 0
 
     def available(self) -> bool:
-        return any(m.can_take("") for m in self.members)
+        """False when every model is out for the rest of the run (resting ones count as available)."""
+        return any(not m.unavailable_reason() for m in self.members)
 
     def limits_reached(self) -> bool:
         """True when the free tiers, not a bug, stopped the forecasts: every
-        model is out for this run or was refused on its last call for a rate
-        limit, and at least one used up its daily quota or hit a rate limit."""
+        model is out, resting after an overload or was refused on its last
+        call for a rate limit, and at least one of them hit a free-tier limit
+        (daily quota, rate limit or overload)."""
         def rate_limited(m: FreeTierLlm) -> bool:
             return m.stats.consecutive_failures > 0 and m.stats.last_error.startswith("RateLimitError")
 
-        return all(not m.can_take("") or rate_limited(m) for m in self.members) and any(
-            m.stats.quota_used_up or rate_limited(m) for m in self.members
+        def out(m: FreeTierLlm) -> bool:
+            return bool(m.unavailable_reason()) or m.resting() or rate_limited(m)
+
+        return all(out(m) for m in self.members) and any(
+            m.stats.quota_used_up or rate_limited(m) or m.stats.overloads for m in self.members
         )
 
     async def invoke(self, prompt, system_prompt: str | None = None) -> str:  # type: ignore[override]
@@ -362,9 +417,10 @@ class FreeModelMix(GeneralLlm):
                     return answer
                 except Exception as e:
                     errors.append(f"{member.model}: {type(e).__name__}")
-            if tried == 0 or round_no == len(self.waits):
+            coming_back = any(m.resting() and m.fits(prompt) and not m.unavailable_reason() for m in order)
+            if (tried == 0 and not coming_back) or round_no == len(self.waits):
                 break
-            logger.info(f"{self.model}: every model failed this round; waiting {self.waits[round_no]:.0f}s before trying again")
+            logger.info(f"{self.model}: no model answered this round; waiting {self.waits[round_no]:.0f}s before trying again")
             await asyncio.sleep(self.waits[round_no])
         skipped = [m.model for m in order if not m.can_take(prompt)]
         detail = "; ".join(errors[-8:]) or "no model could take this prompt"
@@ -386,18 +442,22 @@ MISTRAL = ProviderGate("mistral", min_interval=1.2, max_concurrent=1)
 # Groq limits are per model; 8,000 tokens/minute ~ one big request per minute each
 GROQ_120B = ProviderGate("groq-gpt-oss-120b", min_interval=62.0, max_concurrent=1)
 GROQ_20B = ProviderGate("groq-gpt-oss-20b", min_interval=62.0, max_concurrent=1)
-# Gemini limits are per model as well
-GEMINI_FLASH = ProviderGate("gemini-3.8-flash", min_interval=13.0, max_concurrent=1)
+# Gemini limits (and daily quotas) are per model as well
+GEMINI_FLASH_38 = ProviderGate("gemini-3.8-flash", min_interval=13.0, max_concurrent=1)
+GEMINI_FLASH_37 = ProviderGate("gemini-3.7-flash", min_interval=13.0, max_concurrent=1)
+GEMINI_FLASH_36 = ProviderGate("gemini-3.6-flash", min_interval=13.0, max_concurrent=1)
 GEMINI_LITE_35 = ProviderGate("gemini-3.5-flash-lite", min_interval=6.5, max_concurrent=1)
 GEMINI_LITE_31 = ProviderGate("gemini-3.1-flash-lite", min_interval=6.5, max_concurrent=1)
-GATES = [MISTRAL, GROQ_120B, GROQ_20B, GEMINI_FLASH, GEMINI_LITE_35, GEMINI_LITE_31]
+GATES = [MISTRAL, GROQ_120B, GROQ_20B, GEMINI_FLASH_38, GEMINI_FLASH_37, GEMINI_FLASH_36,
+         GEMINI_LITE_35, GEMINI_LITE_31]
 
 # Where each of the three forecasts for a question starts, and where it goes
-# next when a model is unavailable: Gemini first, Groq first, Mistral first.
+# next when a model is unavailable: Gemini Flash first, Groq first, Mistral
+# first (then a different Gemini Flash, so the three stay different models).
 FORECAST_ORDERS = [
-    ["flash", "lite35", "120b", "medium", "lite31", "20b", "magistral"],
-    ["120b", "20b", "medium", "flash", "lite35", "magistral", "lite31"],
-    ["medium", "magistral", "lite31", "20b", "lite35", "120b", "flash"],
+    ["flash38", "flash37", "flash36", "lite35", "120b", "lite31", "medium", "20b", "magistral"],
+    ["120b", "20b", "flash37", "flash38", "flash36", "lite35", "lite31", "medium", "magistral"],
+    ["medium", "magistral", "flash36", "flash37", "flash38", "lite31", "lite35", "20b", "120b"],
 ]
 
 
@@ -427,7 +487,9 @@ def build_free_llms(predictions_per_question: int = 3) -> tuple[dict[str, Any] |
     makers: dict[str, Any] = {}
     if gemini:
         makers.update(
-            flash=lambda: gm("gemini-3.8-flash", GEMINI_FLASH, timeout=300),
+            flash38=lambda: gm("gemini-3.8-flash", GEMINI_FLASH_38, timeout=300),
+            flash37=lambda: gm("gemini-3.7-flash", GEMINI_FLASH_37, timeout=300),
+            flash36=lambda: gm("gemini-3.6-flash", GEMINI_FLASH_36, timeout=300),
             lite35=lambda: gm("gemini-3.5-flash-lite", GEMINI_LITE_35),
             lite31=lambda: gm("gemini-3.1-flash-lite", GEMINI_LITE_31),
         )
@@ -477,11 +539,16 @@ def build_free_llms(predictions_per_question: int = 3) -> tuple[dict[str, Any] |
         "researcher": "free-news",  # keyless GDELT headlines per claim (main.py)
         "web": None,
     }
-    if groq:  # one web search per question with Groq's browser_search tool (gpt-oss-20b only)
+    if groq:
+        # one web search per question with Groq's browser_search tool: gpt-oss-20b,
+        # then gpt-oss-120b once 20b's daily tokens are used up
+        def web(model: str, gate: ProviderGate) -> FreeTierLlm:
+            return gq(model, gate, tools=[{"type": "browser_search"}], tool_choice="required",
+                      reasoning_effort="low", temperature=0.2, max_tokens=1800)
+
         llms["web"] = FreeModelMix(
             "free-web-search",
-            [[gq("openai/gpt-oss-20b", GROQ_20B, tools=[{"type": "browser_search"}], tool_choice="required",
-                 reasoning_effort="low", temperature=0.2, max_tokens=1800)]],
+            [[web("openai/gpt-oss-20b", GROQ_20B), web("openai/gpt-oss-120b", GROQ_120B)]],
             waits=(),
         )
     return llms, providers
@@ -717,20 +784,23 @@ async def free_news_search(query: str, language: str | None = None, limit: int =
     query = " ".join(str(query).split())[:200]
     lang = language if language and language.strip().lower() != "english" else None
     items: list[dict] = []
-    for keywords in (4, 3):
+    used: list[str] = []
+    for keywords in ((4, 3) if lang else (4, 3, 2)):
         try:
             async with GDELT.slot():
                 items = await asyncio.to_thread(gdelt_news, query, lang, limit, keywords)
         except Exception as e:
+            note("GDELT searches that errored")
             logger.info(f"GDELT search failed for '{query}' ({lang or 'any language'}): {type(e).__name__}: {str(e)[:120]}")
             items = []
+        used = _keywords(query, keywords)
         if items or len(_keywords(query, 5)) <= keywords - 1:
             break  # found something, or fewer keywords wouldn't change the query
     note("GDELT searches with results" if items else "GDELT searches without results")
     label = f"{lang} sources" if lang else "any language"
     if not items:
         return f"[keyless news search] No recent headlines found for: {query}"
-    lines = [f"[keyless news search via GDELT, {label}; headlines only] Query: {query}"]
+    lines = [f"[keyless news search via GDELT, {label}; headlines only] Query: {query} (keywords: {' '.join(used)})"]
     for it in items:
         day = it["date"].strftime("%Y-%m-%d") if it["date"] else "date unknown"
         source = f" ({it['source']})" if it["source"] else ""

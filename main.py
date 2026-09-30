@@ -118,11 +118,19 @@ def forecast_on_all_prize_tournaments(bot, client: MetaculusClient, seasonal_tou
     return asyncio.run(run_all())
 
 
+def one_question_per_type(questions: list) -> list:
+    """Test runs forecast one question of each type (binary, multiple choice,
+    numeric, date, ...) instead of all of them, to save the free daily quotas
+    for the tournaments."""
+    picked: dict[type, object] = {}
+    for q in questions:
+        picked.setdefault(type(q), q)
+    return list(picked.values())
+
+
 def finish_run(run_mode: str, forecast_reports: list, chosen_llms: dict | None) -> int:
     """Prints what each free model did and a one-line verdict (also on the
     run's summary page on GitHub) and returns the exit code."""
-    report = free_model_report()
-    print(report)
     failures = [r for r in forecast_reports if isinstance(r, BaseException)]
     forecasters = (chosen_llms or {}).get("default")
     limits_reached = isinstance(forecasters, FreeModelMix) and forecasters.limits_reached()
@@ -139,7 +147,8 @@ def finish_run(run_mode: str, forecast_reports: list, chosen_llms: dict | None) 
         )
     else:
         verdict = f"❌  {len(failures)} of {len(forecast_reports)} question(s) failed (details above)."
-    print(verdict)
+    report = free_model_report(verdict)
+    print(report)
     summary_file = os.getenv("GITHUB_STEP_SUMMARY")
     if summary_file:
         try:
@@ -1158,11 +1167,14 @@ if __name__ == "__main__":
         # The bot-testing-area tournament contains all question types and is
         # the recommended target for smoke-testing your bot.
         # https://www.metaculus.com/tournament/bot-testing-area/
+        # Free tiers: one question of each type is enough for a test.
         template_bot.skip_previously_forecasted_questions = False
+        test_questions = one_question_per_type(
+            template_bot.metaculus_client.get_all_open_questions_from_tournament("bot-testing-area")
+        )
+        print(f"🧪  Testing on {len(test_questions)} question(s), one of each type.\n")
         forecast_reports = asyncio.run(
-            template_bot.forecast_on_tournament(
-                "bot-testing-area", return_exceptions=True
-            )
+            template_bot.forecast_questions(test_questions, return_exceptions=True)
         )
 
     template_bot.log_report_summary(forecast_reports, raise_errors=False)
