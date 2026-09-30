@@ -3,23 +3,26 @@ name: Forecast on new AI tournament questions
 on:
   workflow_dispatch:
   schedule:
-    - cron: "7,27,47 * * * *" # every 20 min, offset off the hour. Make sure to skip already-forecasted questions!
+    - cron: "7,37 * * * *" # every 30 min, off the hour (free tiers: fewer repeat attempts; MiniBench questions stay open ~3 h)
 
-# Add concurrency group to prevent parallel runs
+# One shared group for every workflow that calls the free models (tournament,
+# Metaculus Cup, Test Bot): runs wait for each other instead of overlapping,
+# because they share the same free-tier quotas. queue: max lets several runs
+# wait instead of the newest cancelling the one already waiting.
 concurrency:
-  group: ${{ github.workflow }}
+  group: metaculus-bot-free-models
   cancel-in-progress: false
+  queue: max
 
-# GitHub Models (free GPT-4.1) uses this workflow's own token; it needs "models: read".
 permissions:
   contents: read
-  models: read
 
 
 # Daily job to run the simple forecast bot
 jobs:
   forecast_job:
     runs-on: ubuntu-latest # determines the machine that will run the job - keep as is
+    timeout-minutes: 120 # a stuck run can't hold up the queue for hours
     steps: # sets up the steps that will be run in order
       # setup repository with all necessary dependencies - keep as is
       - name: Check out repository
@@ -59,5 +62,4 @@ jobs:
           # Free tiers (Tom's setup, Fall 2026)
           MISTRAL_API_KEY: ${{ secrets.MISTRAL_API_KEY }}
           GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
-          GITHUB_API_KEY: ${{ secrets.GITHUB_TOKEN }} # GitHub Models, no extra secret needed
-          GITHUB_API_BASE: https://models.github.ai/inference
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }} # free key from aistudio.google.com - recommended
