@@ -2,6 +2,7 @@ import argparse
 import asyncio
 import json
 import logging
+import os
 import sys
 import re
 from datetime import datetime, timezone
@@ -45,17 +46,23 @@ from forecasting_tools import (
     structure_output,
 )
 
-# Free-tier models (Mistral, Groq, optional Gemini) and keyless news search - Tom's addition, Fall 2026
+# Free-tier models (Gemini, Groq, Mistral) and keyless news search - Tom's addition, Fall 2026
 from free_tier import (
+    FreeModelMix,
+    NoFreeModelLeft,
     build_free_llms,
     free_model_report,
     free_news_search,
     note,
     read_binary,
+    read_date_percentiles,
     read_options,
     read_percentiles,
 )
 from forecasting_tools import PredictedOption
+
+# Three forecasts per question, each starting with a different free model.
+PREDICTIONS_PER_QUESTION = 3
 
 dotenv.load_dotenv()
 logger = logging.getLogger(__name__)
@@ -78,7 +85,7 @@ def market_pulse_slugs(today: datetime | None = None) -> list[str]:
 
 def tournament_has_open_questions(client: MetaculusClient, slug: str) -> bool:
     """One quick request without retries, so a round that hasn't launched yet
-    (or doesn't exist) doesn't slow down every 20-minute run."""
+    (or doesn't exist) doesn't slow down every run."""
     try:
         response = requests.get(
             f"{client.base_url}/posts/",
@@ -109,6 +116,38 @@ def forecast_on_all_prize_tournaments(bot, client: MetaculusClient, seasonal_tou
         return reports
 
     return asyncio.run(run_all())
+
+
+def finish_run(run_mode: str, forecast_reports: list, chosen_llms: dict | None) -> int:
+    """Prints what each free model did and a one-line verdict (also on the
+    run's summary page on GitHub) and returns the exit code."""
+    report = free_model_report()
+    print(report)
+    failures = [r for r in forecast_reports if isinstance(r, BaseException)]
+    forecasters = (chosen_llms or {}).get("default")
+    limits_reached = isinstance(forecasters, FreeModelMix) and forecasters.limits_reached()
+    if not forecast_reports:
+        verdict = "ℹ️  No new questions to forecast in this run."
+    elif not failures:
+        verdict = f"✅  {len(forecast_reports)} question(s) forecast."
+    elif run_mode == "tournament" and limits_reached:
+        # Expected on busy days: the questions stay open and a later run picks
+        # them up, so the run isn't marked as failed (no failure e-mails).
+        verdict = (
+            f"⏳  {len(failures)} of {len(forecast_reports)} question(s) left for later runs: "
+            "the free tiers' limits were reached (daily quotas or rate limits)."
+        )
+    else:
+        verdict = f"❌  {len(failures)} of {len(forecast_reports)} question(s) failed (details above)."
+    print(verdict)
+    summary_file = os.getenv("GITHUB_STEP_SUMMARY")
+    if summary_file:
+        try:
+            with open(summary_file, "a", encoding="utf-8") as f:
+                f.write(f"### {verdict}\n\n```\n{report}\n```\n")
+        except OSError:
+            pass
+    return 1 if verdict.startswith("❌") else 0
 
 
 class SummerTemplateBot2026(ForecastBot):
@@ -204,6 +243,15 @@ class SummerTemplateBot2026(ForecastBot):
         if limiter is None:
             limiter = self._question_limiters[loop] = asyncio.Semaphore(1)
         async with limiter:
+            forecasters = self._llms.get("default")
+            if isinstance(forecasters, FreeModelMix):
+                if not forecasters.available():
+                    # Don't spend research calls on a question nobody can forecast
+                    raise NoFreeModelLeft(
+                        f"Skipped {question.page_url}: no free forecasting model is left in this run "
+                        "(daily quotas used up or models failing). A later run will pick it up."
+                    )
+                forecasters.restart_slots()
             return await super()._run_individual_question_with_error_propagation(question)
 
     ##################################### RESEARCH #####################################
@@ -232,10 +280,18 @@ class SummerTemplateBot2026(ForecastBot):
 
     async def _web_overview(self, question: MetaculusQuestion) -> str:
         """One web search for the whole question (Groq gpt-oss browser_search).
-        Returns "" when there is no web-search model or it fails."""
+        Returns "" when there is no web-search model or it fails. The result is
+        kept, so falling back to the simpler research doesn't search twice."""
         web = self._llms.get("web")
         if web is None:
             return ""
+        cache: dict[str, str] = self.__dict__.setdefault("_web_overviews", {})
+        key = str(question.page_url or question.id_of_question or question.question_text)
+        if key not in cache:
+            cache[key] = await self._search_web_once(web, question)
+        return cache[key]
+
+    async def _search_web_once(self, web: GeneralLlm, question: MetaculusQuestion) -> str:
         today = datetime.now().strftime("%Y-%m-%d")
         prompt = clean_indents(
             f"""
@@ -423,7 +479,7 @@ class SummerTemplateBot2026(ForecastBot):
             )
             fact_sheet = await self.get_llm("writer", "llm").invoke(prompt)
 
-            abridged = findings_text[:3000]
+            abridged = findings_text[:1500]  # free tiers: keep the forecast prompts short
             research = (
                 f"{fact_sheet}\n\n---\nRaw search notes (abridged):\n{abridged}"
             )
@@ -461,7 +517,7 @@ class SummerTemplateBot2026(ForecastBot):
             elif researcher == "free-news":
                 overview = await self._web_overview(question)
                 headlines = await free_news_search(question.question_text)
-                research = (overview + "\n\n" + headlines).strip()
+                research = (overview[:4000] + "\n\n" + headlines).strip()
             elif (
                 researcher == "asknews/news-summaries"
                 or researcher == "asknews/deep-research/low-depth"
@@ -619,7 +675,9 @@ class SummerTemplateBot2026(ForecastBot):
         )
         reasoning = await self.get_llm("default", "llm").invoke(prompt)
         logger.info(f"Reasoning for URL {question.page_url}: {reasoning}")
-        direct = read_options(reasoning, list(question.options))
+        options = list(question.options)
+        # the final "Red: 20%" block, or the prompt's own "Option_A: 20%" pattern taken literally
+        direct = read_options(reasoning, options)
         if direct is not None:
             note("answers read directly")
             predicted_option_list = PredictedOptionList(
@@ -725,7 +783,7 @@ class SummerTemplateBot2026(ForecastBot):
             """
         )
         direct = read_percentiles(reasoning)
-        if direct is not None and self._plausible_for_question(list(direct.values()), question):
+        if direct is not None and self._plausible(list(direct.values()), question.lower_bound, question.upper_bound):
             note("answers read directly")
             percentile_list = [Percentile(percentile=p / 100, value=v) for p, v in sorted(direct.items())]
         else:
@@ -744,11 +802,10 @@ class SummerTemplateBot2026(ForecastBot):
         return ReasonedPrediction(prediction_value=prediction, reasoning=reasoning)
 
     @staticmethod
-    def _plausible_for_question(values: list[float], question: NumericQuestion) -> bool:
+    def _plausible(values: list[float], lo: float | None, hi: float | None) -> bool:
         """Numbers read directly are only used when they sit near the question's
         range; otherwise they may be in other units, and the parser model (which
         converts units) reads them instead."""
-        lo, hi = question.lower_bound, question.upper_bound
         if lo is None or hi is None:
             return True
         span = max(hi - lo, 1e-9)
@@ -832,21 +889,31 @@ class SummerTemplateBot2026(ForecastBot):
             - If percentiles are not explicitly given (e.g. only a single value is given) please don't return a parsed output, but rather indicate that the answer is not explicitly given in the text.
             """
         )
-        date_percentile_list: list[DatePercentile] = await structure_output(
-            reasoning,
-            list[DatePercentile],
-            model=self.get_llm("parser", "llm"),
-            additional_instructions=parsing_instructions,
-            num_validation_samples=self._structure_output_validation_samples,
-        )
-
-        percentile_list = [
-            Percentile(
-                percentile=percentile.percentile,
-                value=percentile.value.timestamp(),
+        direct = read_date_percentiles(reasoning)  # "Percentile 10: YYYY-MM-DD" lines
+        if direct is not None and self._plausible(
+            [d.timestamp() for d in direct.values()],
+            question.lower_bound.timestamp() if question.lower_bound else None,
+            question.upper_bound.timestamp() if question.upper_bound else None,
+        ):
+            note("answers read directly")
+            percentile_list = [Percentile(percentile=p / 100, value=d.timestamp()) for p, d in sorted(direct.items())]
+        else:
+            note("answers read by the parser model")
+            date_percentile_list: list[DatePercentile] = await structure_output(
+                reasoning,
+                list[DatePercentile],
+                model=self.get_llm("parser", "llm"),
+                additional_instructions=parsing_instructions,
+                num_validation_samples=self._structure_output_validation_samples,
             )
-            for percentile in date_percentile_list
-        ]
+
+            percentile_list = [
+                Percentile(
+                    percentile=percentile.percentile,
+                    value=percentile.value.timestamp(),
+                )
+                for percentile in date_percentile_list
+            ]
         prediction = NumericDistribution.from_question(percentile_list, question)
         logger.info(
             f"Forecasted URL {question.page_url} with prediction: {prediction.declared_percentiles}."
@@ -1011,15 +1078,20 @@ if __name__ == "__main__":
 
     # ---- Tom's configuration (Fall 2026): free tiers only ---------------------
     # Metaculus declined the LLM-credit request, so the bot uses free tiers:
-    # Mistral (MISTRAL_API_KEY), Groq (GROQ_API_KEY) and, optionally, Google
-    # Gemini (GEMINI_API_KEY). See free_tier.py for the limits of each.
-    chosen_llms, free_providers = build_free_llms()
+    # Google Gemini (GEMINI_API_KEY), Groq (GROQ_API_KEY) and Mistral
+    # (MISTRAL_API_KEY), each optional. See free_tier.py for their limits.
+    chosen_llms, free_providers = build_free_llms(PREDICTIONS_PER_QUESTION)
     if free_providers:
         print(f"🆓  Free models from: {', '.join(free_providers)}\n")
+        if "Gemini" not in free_providers:
+            print(
+                "💡  Tip: a free Google Gemini key (GEMINI_API_KEY) multiplies how many questions\n"
+                "    the bot can forecast per day. See free_tier.py.\n"
+            )
 
     template_bot = SummerTemplateBot2026(
         research_reports_per_question=1,
-        predictions_per_research_report=5,
+        predictions_per_research_report=PREDICTIONS_PER_QUESTION,
         use_research_summary_to_forecast=False,
         publish_reports_to_metaculus=publish_to_metaculus,
         folder_to_save_reports_to=None,
@@ -1027,20 +1099,29 @@ if __name__ == "__main__":
         extra_metadata_in_explanation=True,
         llms=chosen_llms,
         enable_summarize_research=False,  # free tiers: saves one model call per question
+        # Free tiers: one forecast that got through is better than none. (The
+        # default, 0.5, dropped questions where 2 of 5 forecasts succeeded.)
+        required_successful_predictions=0.3,
     )
-    template_bot.use_fact_check_research = chosen_llms is not None
+    # The fact-check research needs a writer model (Gemini or Mistral);
+    # without one the bot uses the web search and news headlines directly.
+    template_bot.use_fact_check_research = bool(chosen_llms and chosen_llms.get("writer"))
 
     # Fall 2026 FutureEval seasonal tournament (28 Sep 2026 - 6 Jan 2027).
     # The pinned forecasting-tools version still points CURRENT_AI_COMPETITION_ID
     # at the Summer 2026 tournament, so target Fall 2026 explicitly (ID 33121).
     FALL_2026_TOURNAMENT = "fall-futureeval-2026"
 
+    # Likewise CURRENT_METACULUS_CUP_ID still points at the Summer 2026 Cup;
+    # the Fall 2026 Cup runs 28 Aug 2026 - 1 Jan 2027.
+    METACULUS_CUP_FALL_2026 = "metaculus-cup-fall-2026"
+
     # Per-mode tournament URL shown in the summary banner footer. These
     # piggyback on the forecasting_tools SDK constants and need updating
     # whenever those rotate seasons.
     TOURNAMENT_URLS = {
         "tournament": "https://www.metaculus.com/tournament/fall-futureeval-2026/",
-        "metaculus_cup": "https://www.metaculus.com/tournament/metaculus-cup-summer-2025/",
+        "metaculus_cup": "https://www.metaculus.com/tournament/metaculus-cup-fall-2026/",
         "test_questions": "https://www.metaculus.com/tournament/bot-testing-area/",
     }
 
@@ -1065,10 +1146,12 @@ if __name__ == "__main__":
         # The Metaculus Cup may be uninitialized near the start of a season
         # (Jan/May/Sep). AXC_2025_TOURNAMENT_ID = 32564 and
         # AI_2027_TOURNAMENT_ID = "ai-2027" are also valid targets here.
-        template_bot.skip_previously_forecasted_questions = False
+        # Free tiers: only new Cup questions, so the prize tournaments keep
+        # the daily quotas (the template re-forecast every open question).
+        template_bot.skip_previously_forecasted_questions = True
         forecast_reports = asyncio.run(
             template_bot.forecast_on_tournament(
-                client.CURRENT_METACULUS_CUP_ID, return_exceptions=True
+                METACULUS_CUP_FALL_2026, return_exceptions=True
             )
         )
     elif run_mode == "test_questions":
@@ -1088,9 +1171,4 @@ if __name__ == "__main__":
         will_publish=publish_to_metaculus,
         tournament_url=TOURNAMENT_URLS.get(run_mode),
     )
-    # A short report of what each free model did: the last lines of the log
-    print(free_model_report())
-    failures = [r for r in forecast_reports if isinstance(r, BaseException)]
-    if failures:
-        print(f"❌  {len(failures)} of {len(forecast_reports)} question(s) failed (details above).")
-        sys.exit(1)
+    sys.exit(finish_run(run_mode, forecast_reports, chosen_llms))
